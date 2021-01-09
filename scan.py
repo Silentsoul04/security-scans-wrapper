@@ -40,7 +40,7 @@ class Process:
 
   def run(self, url) -> subprocess.CompletedProcess:
     """
-    Run the command with the given URL. 
+    Run the command with the given URL. It substitutes the '{{url}}' from the command. 
     """
     # substiture template
     cmd = self.command.replace('{{url}}', shlex.quote(url)) if (
@@ -247,7 +247,7 @@ def get_enabled_tools(configured_tools:Dict[str, Any], remainings_args: Iterable
     for i_tool in invalid_tools:
       if i_tool.startswith('no') and i_tool[2:] in enabled_tools:
         enabled_tools.remove(i_tool[2:])
-        invalid_tools.remove(i_tool[2:])
+        invalid_tools.remove(i_tool)
   
   if invalid_tools:
       _inv_tools_str = ' '.join([f"--{tool}" for tool in invalid_tools])
@@ -277,7 +277,8 @@ def main():
 
     # Fail fast
     if not enabled_tools:
-      print(f"Error: At least one tool must be enable: use --<tool>. i.e.: --{next(iter(configured_tools))}")
+      print(f"Error: At least one tool must be enable: use --<tool>. i.e.: --{next(iter(configured_tools))}.\n"
+        "You can also use --al and -no-<tool> flags. ")
       exit(1)
 
     else:
@@ -287,6 +288,10 @@ def main():
     if not args.url:
       print("Error: No URL supplied, supply URL with --url <url>")
       exit(1)
+
+    mailsender = None
+    if 'mail' in config:
+      mailsender = MailSender(**config['mail'])
 
     report_items: Iterable[ReportItem] = list()
 
@@ -305,9 +310,6 @@ def main():
                      url=args.url, datetime=datetime.now().isoformat(timespec='seconds') )
 
     if args.mailto:
-      mailsender = None
-      if 'mail' in config:
-        mailsender = MailSender(**config['mail'])
       if mailsender:
         print("Sending email report... ")
         mailsender.send(report, args.mailto)

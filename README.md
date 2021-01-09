@@ -32,7 +32,7 @@ description = Nikto - Web server scanner
 command = nikto -h {{url}} -o /tmp/nikto-report.html
 # Attach the output files to the email. (accepts non reccursive globbing with '*')
 output_files = /tmp/nikto-report.html
-popen_args = {"text":true}
+popen_args = {"encoding":"utf-8", "errors":"replace"}
 
 
 [--rapidscan]
@@ -44,7 +44,7 @@ output_files =
     /tmp/rapidscan-reports/RS-Vulnerability-Report
     /tmp/rapidscan-reports/RS-Debug-ScanLog 
 # The command can be a shell script. But "shell":true needs to be enabled here. 
-popen_args = {"text":true, "shell":true} 
+popen_args = {"shell":true, "encoding":"utf-8", "errors":"replace"}
 ```
 
 Then run the tool of you choice and send report by email with:
