@@ -20,10 +20,10 @@ title = Security scans
 [mail]
 from_email=me@gmail.com
 smtp_server=smtp.gmail.com:587
-smtp_auth=No
+smtp_auth=false
 smtp_user=me@gmail.com
 smtp_pass=P@assW0rd
-smtp_ssl=Yes
+smtp_ssl=true
 
 
 [--nikto]

@@ -157,8 +157,9 @@ class MailSender:
     from_email: str
     smtp_server: str
 
-    smtp_ssl: bool = False
-    smtp_auth: bool = False
+    smtp_ssl: bool = attr.ib(default=False, converter=json.loads)
+    smtp_auth: bool = attr.ib(default=False, converter=json.loads)
+    
     smtp_user: str = ""
     smtp_pass: str = ""
 
