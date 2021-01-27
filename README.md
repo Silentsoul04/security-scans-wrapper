@@ -10,7 +10,7 @@ Install
 
     pip install -r requirements.txt
 
-Configure shell commands/scrtipts with a config file: 
+Configure scripts with a config file: 
 
 ```ini
 [general]
