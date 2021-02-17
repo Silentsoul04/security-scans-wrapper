@@ -36,15 +36,18 @@ class Process:
   """
   command: str
 
-  popen_args: Dict[str, Any] = attr.ib(converter=json.loads)
+  popen_args: Dict[str, Any] = attr.ib(converter=json.loads, factory=dict)
 
-  def run(self, url) -> subprocess.CompletedProcess:
+  def run(self, **kwargs) -> subprocess.CompletedProcess:
     """
-    Run the command with the given URL. It substitutes the '{{url}}' from the command. 
+    Run the command with the given interpolation parameters.
     """
-    # substiture template
-    cmd = self.command.replace('{{url}}', shlex.quote(url)) if (
-      '{{url}}' in self.command ) else self.command
+    # substitute interpolations
+    cmd = self.command
+    for k,v in kwargs.items():
+      cmd = cmd.replace('{{%s}}'%k, shlex.quote(v)) if (
+        '{{%s}}'%k in cmd ) else cmd
+    
     # cast command to right format depending shell = True
     _cmd = shlex.split(cmd) if not self.popen_args.get('shell', False) else cmd
     print(f"Running: '{_cmd}'\n(Popen arguments: {self.popen_args})")
@@ -222,14 +225,25 @@ Secuity scans are the main usage.
       epilog="Configure tools in the config file and activate then with --<tool>.\nConfig exemple:\n"
              "[--nikto]\ndescription = Nikto web server scanner\ncommand = nikto -h $url\n\n"
              "Then use --nikto to run nikto scan on a given URL. You can also specify --all --no-nikto to exclude tools.", formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--config', '-c', help="Configuration file(s).", action="extend", nargs="+", required=True)
-    parser.add_argument('--url', '-u', help="URL to scan.")
-    parser.add_argument('--mailto', '-m', help="Send report by email to recipient(s).", action="extend", nargs="+")
-    parser.add_argument('--output', '-o', help="Save report to HTML file. ", 
+    parser.add_argument('--config', '-c', metavar="PATH", help="Configuration file(s).", action="extend", nargs="+", required=True)
+    parser.add_argument('--url', '-u', metavar="URL", help="URL to scan.")
+    parser.add_argument('--arg', '-a', metavar="KEY=VALUE", help="Extra interpolation arguments", action="extend", nargs="+", default=[])
+    parser.add_argument('--mailto', '-m', metavar="EMAIL", help="Send report by email to recipient(s).", action="extend", nargs="+")
+    parser.add_argument('--output', '-o', metavar="PATH", help="Save report to HTML file. ", 
                         default='-', type=argparse.FileType('w', encoding='UTF-8'))
     
     return  parser
 
+def get_extra_arguments(raw_extra_args: List[str]) -> Dict[str, str]:
+  extra_args = {}
+  for arg in raw_extra_args:
+    parsed = arg.split("=", 1)
+    if len(parsed) != 2:
+      print(f"Cannot parse extra interpolation argument: '{arg}'. Should be like 'KEY=VALUE'")
+      continue
+    key, value = parsed
+    extra_args[key] = value
+  return extra_args
 
 def get_enabled_tools(configured_tools:Dict[str, Any], remainings_args: Iterable[str]) -> List[str]:
   """
@@ -273,21 +287,21 @@ def main():
     else:
       print(f"Configured tools: {', '.join(configured_tools.keys())}")
 
+    # Fail fast
+    if not args.url:
+      print("Error: No URL supplied, supply URL with --url <url>")
+      exit(1)
+
     enabled_tools: List[str] = get_enabled_tools(configured_tools, remainings)
 
     # Fail fast
     if not enabled_tools:
       print(f"Error: At least one tool must be enable: use --<tool>. i.e.: --{next(iter(configured_tools))}.\n"
-        "You can also use --al and -no-<tool> flags. ")
+        "You can also use --al and --no-<tool> flags. ")
       exit(1)
 
     else:
       print(f"Enabled tools: {' '.join(enabled_tools) if enabled_tools!=list(configured_tools) else 'all'}")
-
-    # Fail fast
-    if not args.url:
-      print("Error: No URL supplied, supply URL with --url <url>")
-      exit(1)
 
     mailsender = None
     if 'mail' in config:
@@ -295,12 +309,14 @@ def main():
 
     report_items: Iterable[ReportItem] = list()
 
+    extra_args = get_extra_arguments(args.arg)
+
     for tool in enabled_tools:
        
         process = Process(  command=configured_tools[tool]['command'].strip(), 
                             popen_args=configured_tools[tool].get('popen_args', '{}') )
 
-        completed_p = process.run(args.url)
+        completed_p = process.run(url=args.url, **extra_args)
 
         report_items.append(ReportItem( process=completed_p,
                                         description=configured_tools[tool]['description'],
