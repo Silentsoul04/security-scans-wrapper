@@ -327,8 +327,10 @@ def main():
 
     if args.mailto:
       if mailsender:
+        tos: List[str] = []
+        [ tos.extend(mail.split(',')) for mail in args.mailto]
         print("Sending email report... ")
-        mailsender.send(report, args.mailto)
+        mailsender.send(report, tos)
       else:
         print("Not sending email report because no [mail] config is provided. ")
     
