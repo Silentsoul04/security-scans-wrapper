@@ -7,7 +7,7 @@ Secuity scans are the main usage.
 
 import sys
 import subprocess
-from typing import Dict, Any, Iterable, List
+from typing import Dict, Any, Iterable, List, Optional, Tuple, Callable
 import smtplib
 import json
 import argparse
@@ -15,9 +15,14 @@ import configparser
 import functools
 import pathlib
 import io
+import os
+import re
+import signal
 import glob
 import shlex
-from datetime import datetime
+import queue
+import threading
+from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
 from email.mime.text import MIMEText
@@ -29,32 +34,146 @@ ansi2HTMLconverter = Ansi2HTMLConverter(inline=True, linkify=True)
 
 print = functools.partial(print, file=sys.stderr)
 
-@attr.s(auto_attribs=True, frozen=True)
+def parse_timedelta(time_str: str) -> timedelta:
+    """
+    Parse a time string e.g. (2h13m) into a timedelta object.  Stolen on the web
+    """
+    regex = re.compile(
+        r"^((?P<days>[\.\d]+?)d)?((?P<hours>[\.\d]+?)h)?((?P<minutes>[\.\d]+?)m)?((?P<seconds>[\.\d]+?)s)?$"
+    )
+    parts = regex.match(time_str)
+    if parts is None:
+        raise ValueError(
+            f"Could not parse any time information from '{time_str}'.  Examples of valid strings: '8h', '2d8h5m20s', '2m4s'"
+        )
+    time_params = {
+        name: float(param) for name, param in parts.groupdict().items() if param
+    }
+    return timedelta(**time_params)  # type: ignore [arg-type]
+
+def func_timeout(
+    timeout: float,
+    func: Callable[..., Any],
+    args: Tuple[Any, ...] = (),
+    kwargs: Dict[str, Any] = {},
+    ) -> Any:
+    """Run func with the given timeout.
+    :raise TimeoutError: If func didn't finish running within the given timeout.
+    """
+
+    class FuncThread(threading.Thread):
+        def __init__(self, bucket: queue.Queue) -> None:  # type: ignore [type-arg]
+            threading.Thread.__init__(self)
+            self.result: Any = None
+            self.bucket: queue.Queue = bucket  # type: ignore [type-arg]
+            self.err: Optional[Exception] = None
+            self.daemon = True # die when the main thread dies
+
+        def run(self) -> None:
+            try:
+                self.result = func(*args, **kwargs)
+            except Exception as err:
+                self.bucket.put(sys.exc_info())
+                self.err = err
+
+    bucket: queue.Queue = queue.Queue()  # type: ignore [type-arg]
+    it = FuncThread(bucket)
+    it.start()
+    it.join(timeout)
+    if it.is_alive():
+        raise TimeoutError()
+    else:
+        try:
+            _, _, exc_trace = bucket.get(block=False)
+        except queue.Empty:
+            return it.result
+        else:
+            raise it.err.with_traceback(exc_trace)  # type: ignore [union-attr]
+
+@attr.s(auto_attribs=True)
 class Process:
   """
-  Run arbitrary commands with subprocess from string command with '{{url}}' interpolation and popen args as JSON. 
+  Run arbitrary commands with subprocess from string command with '{{url}}' interpolations and popen args as JSON. 
   """
   command: str
-
+  timeout_seconds: int
   popen_args: Dict[str, Any] = attr.ib(converter=json.loads, factory=dict)
+  is_shell: Optional[bool] = attr.ib(default=None, init=False)
+  popen: Optional[subprocess.Popen] = attr.ib(default=None, init=False)
+
+  @staticmethod
+  def _interpolate_real(cmd: str, **kwargs) -> str:
+    for k,v in kwargs.items():
+      if '{{%s}}'%k in cmd:
+        cmd = cmd.replace('{{%s}}'%k, shlex.quote(v))
+    return cmd
+
+  @staticmethod
+  def _interpolate_no_values(cmd: str, **kwargs) -> str:
+    for k,v in kwargs.items():
+      if k == 'url':
+        if '{{%s}}'%k in cmd:
+          cmd = cmd.replace('{{%s}}'%k, shlex.quote(v))
+      else:
+        if '{{%s}}'%k in cmd:
+          # Do not show values of interpolation place holder except url. 
+          cmd = cmd.replace('{{%s}}'%k, '***')
+    return cmd
+  
+  @staticmethod
+  def _check_interpolation_leftovers(cmd: str) -> None:
+    placeholder_regex = re.compile(r'{{((?:}(?!})|[^}])*)}}')
+    all_leftovers_placeholder = placeholder_regex.findall(cmd)
+    if all_leftovers_placeholder:
+      print("It looks like the following place holders could not get interpolated: " 
+        f"{', '.join(all_leftovers_placeholder)}. Use --arg KEY=VALUE to pass values.")
+
+  def kill(self) -> None:
+    """Killing the process"""
+    assert self.popen is not None
+    if self.is_shell:
+      os.kill(os.getpgid(self.popen.pid), signal.SIGINT)
+    else:
+      os.kill(self.popen.pid, signal.SIGINT)
 
   def run(self, **kwargs) -> subprocess.CompletedProcess:
     """
     Run the command with the given interpolation parameters.
     """
     # substitute interpolations
-    cmd = self.command
-    for k,v in kwargs.items():
-      cmd = cmd.replace('{{%s}}'%k, shlex.quote(v)) if (
-        '{{%s}}'%k in cmd ) else cmd
+    cmd = self._interpolate_real(self.command, **kwargs)
+
+    # warns
+    self._check_interpolation_leftovers(cmd)
+
+    self.is_shell = self.popen_args.get('shell', False)
     
     # cast command to right format depending shell = True
-    _cmd = shlex.split(cmd) if not self.popen_args.get('shell', False) else cmd
+    _cmd = shlex.split(cmd) if not self.is_shell else cmd
     print(f"Running: '{_cmd}'\n(Popen arguments: {self.popen_args})")
-    p = subprocess.run(
+    
+    if self.is_shell:
+      # https://stackoverflow.com/questions/4789837/how-to-terminate-a-python-subprocess-launched-with-shell-true
+      self.popen_args.update(dict(preexec_fn=os.setsid))
+    
+    self.popen = subprocess.Popen(
       _cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **self.popen_args)
-    p.args = cmd.strip()
-    return p
+    
+    try:
+      stdout, stderr = func_timeout(timeout=self.timeout_seconds, func=self.popen.communicate)
+    except TimeoutError:
+      self.kill()
+      print(f"Timeout reached after {self.timeout_seconds} seconds for process {self.popen.pid} while running: '{self.popen.args}'")
+      stdout, stderr = f"The command timed out after {self.timeout_seconds} seconds. Configure 'scan_timeout' to allow more time.", ""
+    except KeyboardInterrupt:
+      self.kill()
+      raise
+      
+    return subprocess.CompletedProcess(
+        args = self._interpolate_no_values(self.command, **kwargs),
+        returncode = self.popen.returncode, 
+        stdout = stdout, 
+        stderr = stderr)
 
 
 @attr.s(auto_attribs=True, frozen=True)
@@ -229,8 +348,8 @@ Secuity scans are the main usage.
     parser.add_argument('--url', '-u', metavar="URL", help="URL to scan.")
     parser.add_argument('--arg', '-a', metavar="KEY=VALUE", help="Extra interpolation arguments", action="extend", nargs="+", default=[])
     parser.add_argument('--mailto', '-m', metavar="EMAIL", help="Send report by email to recipient(s).", action="extend", nargs="+")
-    parser.add_argument('--output', '-o', metavar="PATH", help="Save report to HTML file. ", 
-                        default='-', type=argparse.FileType('w', encoding='UTF-8'))
+    parser.add_argument('--output', '-o', metavar="PATH", help="Save report to HTML file. Default to report.html", 
+                        default='report.html', type=argparse.FileType('w', encoding='UTF-8'))
     
     return  parser
 
@@ -311,13 +430,16 @@ def main():
 
     extra_args = get_extra_arguments(args.arg)
 
+    timeout_seconds = parse_timedelta(config['general'].get('scan_timeout', '4h')).total_seconds()
+
     for tool in enabled_tools:
        
         process = Process(  command=configured_tools[tool]['command'].strip(), 
+                            timeout_seconds=timeout_seconds,
                             popen_args=configured_tools[tool].get('popen_args', '{}') )
 
         completed_p = process.run(url=args.url, **extra_args)
-
+      
         report_items.append(ReportItem( process=completed_p,
                                         description=configured_tools[tool]['description'],
                                         output_files=configured_tools[tool].get('output_files', '').strip().splitlines() ))
@@ -328,7 +450,8 @@ def main():
     if args.mailto:
       if mailsender:
         tos: List[str] = []
-        [ tos.extend(mail.split(',')) for mail in args.mailto]
+        for mail in args.mailto:
+          tos.extend(mail.split(','))
         print("Sending email report... ")
         mailsender.send(report, tos)
       else:
@@ -338,9 +461,7 @@ def main():
 
     print(f"HTML report wrote to: '{args.output.name}'")
 
-    args.output.flush()
-    args.output.close()
-
+    exit(0)
 
 if __name__ == "__main__":
   main()

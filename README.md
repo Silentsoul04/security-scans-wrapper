@@ -15,7 +15,7 @@ Configure scripts with a config file:
 ```ini
 [general]
 title = Security scans
-
+scan_timeout = 4h
 
 [mail]
 from_email=me@gmail.com
@@ -67,7 +67,7 @@ You can use `--all` combined with `--no-<tool>` to run all configured tools and 
 ./scan.py -c config.ini --mailto me@gmail.com --url http://exemple.com --all --no-wpscan
 ```
 
-Save the HTML report to file with the `--output` option. Default will print HTML to stdout.  
+Save the HTML report to file with the `--output` option. Default is `./report.html`, use `-` to indicate stdout. 
 
 Additionaly, arbitrary interpolation values can be added to the scripts. This can be useful to configure authentication. 
 The values should be supplied by arguments like `--arg KEY=VALUE`. 
