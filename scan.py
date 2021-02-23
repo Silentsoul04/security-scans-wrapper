@@ -7,7 +7,7 @@ Secuity scans are the main usage.
 
 import sys
 import subprocess
-from typing import Dict, Any, Iterable, List, Optional, Tuple, Callable
+from typing import Sequence, TYPE_CHECKING, Dict, Any, Iterable, List, Optional, Tuple, Callable, NoReturn
 import smtplib
 import json
 import argparse
@@ -90,16 +90,45 @@ def func_timeout(
         else:
             raise it.err.with_traceback(exc_trace)  # type: ignore [union-attr]
 
+def error(msg: str) -> NoReturn:
+    print(f"ERROR: {msg}")
+    exit(1)
+
 @attr.s(auto_attribs=True)
 class Process:
   """
-  Run arbitrary commands with subprocess from string command with '{{url}}' interpolations and popen args as JSON. 
+  Run arbitrary commands with subprocess from string command with string interpolations and popen args as JSON. 
   """
-  command: str
-  timeout_seconds: int
-  popen_args: Dict[str, Any] = attr.ib(converter=json.loads, factory=dict)
-  is_shell: Optional[bool] = attr.ib(default=None, init=False)
-  popen: Optional[subprocess.Popen] = attr.ib(default=None, init=False)
+  command: str = attr.ib() # not the actual command
+  popen: subprocess.Popen = attr.ib()
+  timeout: int = attr.ib(converter=lambda x: parse_timedelta(x).total_seconds())
+  popen_args: Dict[str, Any] = attr.ib(factory=list)
+ 
+  @classmethod
+  def new(cls, command: str, interpolations: Dict[str, str], 
+          timeout: str, popen_args: Dict[str, Any]):
+    
+    """Create a new process with the given interpolation parameters."""
+    # substitute interpolations
+    cmd = cls._interpolate_real(command, **interpolations)
+    
+    # fail if missing place holders
+    cls._check_interpolation_leftovers(cmd)
+
+    is_shell = popen_args.get('shell', False)
+    
+    # cast command to right format depending shell = True
+    _cmd = shlex.split(cmd) if not is_shell else cmd
+    
+    if is_shell:
+      # https://stackoverflow.com/questions/4789837/how-to-terminate-a-python-subprocess-launched-with-shell-true
+      popen_args.update(dict(preexec_fn=os.setsid))
+    
+    popen = subprocess.Popen(
+      _cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **popen_args)
+
+    return cls(command=cls._interpolate_no_values(command, **interpolations), 
+               popen=popen, timeout=timeout, popen_args=popen_args)
 
   @staticmethod
   def _interpolate_real(cmd: str, **kwargs) -> str:
@@ -125,56 +154,58 @@ class Process:
     placeholder_regex = re.compile(r'{{((?:}(?!})|[^}])*)}}')
     all_leftovers_placeholder = placeholder_regex.findall(cmd)
     if all_leftovers_placeholder:
-      print("It looks like the following place holders could not get interpolated: " 
+      error("the following place holders could not get interpolated: " 
         f"{', '.join(all_leftovers_placeholder)}. Use --arg KEY=VALUE to pass values.")
 
   def kill(self) -> None:
-    """Killing the process"""
+    """Kill the process"""
     assert self.popen is not None
-    if self.is_shell:
-      os.kill(os.getpgid(self.popen.pid), signal.SIGINT)
+    if self.popen_args.get('shell', False):
+      os.kill(os.getpgid(self.popen.pid), signal.SIGKILL)
     else:
-      os.kill(self.popen.pid, signal.SIGINT)
+      os.kill(self.popen.pid, signal.SIGKILL)
 
-  def run(self, **kwargs) -> subprocess.CompletedProcess:
-    """
-    Run the command with the given interpolation parameters.
-    """
-    # substitute interpolations
-    cmd = self._interpolate_real(self.command, **kwargs)
+  def run(self) -> subprocess.CompletedProcess:
+    """Run the process."""
+    
+    # the actual command
+    print(f"Running: '{self.popen.args}'\n(Popen arguments: {self.popen_args})")
 
-    # warns
-    self._check_interpolation_leftovers(cmd)
-
-    self.is_shell = self.popen_args.get('shell', False)
-    
-    # cast command to right format depending shell = True
-    _cmd = shlex.split(cmd) if not self.is_shell else cmd
-    print(f"Running: '{_cmd}'\n(Popen arguments: {self.popen_args})")
-    
-    if self.is_shell:
-      # https://stackoverflow.com/questions/4789837/how-to-terminate-a-python-subprocess-launched-with-shell-true
-      self.popen_args.update(dict(preexec_fn=os.setsid))
-    
-    self.popen = subprocess.Popen(
-      _cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **self.popen_args)
-    
     try:
-      stdout, stderr = func_timeout(timeout=self.timeout_seconds, func=self.popen.communicate)
+      stdout, stderr = func_timeout(timeout=self.timeout, func=self.popen.communicate)
     except TimeoutError:
       self.kill()
-      print(f"Timeout reached after {self.timeout_seconds} seconds for process {self.popen.pid} while running: '{self.popen.args}'")
-      stdout, stderr = f"The command timed out after {self.timeout_seconds} seconds. Configure 'scan_timeout' to allow more time.", ""
+      print(f"Timeout reached after {self.timeout} seconds for process {self.popen.pid} while running: '{self.popen.args}'")
+      stdout, stderr = f"The command timed out after {self.timeout} seconds. Configure 'scan_timeout' to allow more time.", ""
     except KeyboardInterrupt:
       self.kill()
       raise
-      
+
     return subprocess.CompletedProcess(
-        args = self._interpolate_no_values(self.command, **kwargs),
+        args = self.command, 
         returncode = self.popen.returncode, 
         stdout = stdout, 
         stderr = stderr)
 
+def _glob_filepaths(files: List[str]) -> List[pathlib.Path]:
+    # find output files with globbing if any
+    globbed = list()
+    for f in files:
+      found_files = glob.glob(f)
+      if not found_files:
+        print(f"No file found at path '{f}'")
+      else:
+        globbed.extend(found_files)
+
+    paths = [ pathlib.Path(f) for f in globbed  ]
+    file_paths: List[pathlib.Path] = []
+    for path in paths:
+      if path.exists():
+        if path.is_file():
+          file_paths.append(path)
+    if file_paths:
+      print(f"Output file(s): {', '.join(f.as_posix() for f in file_paths)}")
+    return file_paths
 
 @attr.s(auto_attribs=True, frozen=True)
 class ReportItem:
@@ -186,30 +217,7 @@ class ReportItem:
 
     process: subprocess.CompletedProcess
     description: str  
-
-    def _get_filepaths(files: List[str]) -> List[pathlib.Path]:
-
-      # find output files with globbing if any
-      globbed = list()
-      for f in (files if isinstance(files, list) else [files]):
-        found_files = glob.glob(f)
-        if not found_files:
-          print(f"File not found for path {f}")
-        else:
-          globbed.extend(found_files)
-
-      paths = [ pathlib.Path(f) for f in globbed  ]
-      files = list()
-      for path in paths:
-        if path.exists():
-          if path.is_file():
-            files.append(path)
-      if files:
-        print(f"Output file(s): {', '.join(f.as_posix() for f in files)}")
-      return files
-
-
-    output_files: List[pathlib.Path] = attr.ib(factory=list, converter=_get_filepaths)
+    output_files: List[pathlib.Path] = attr.ib(factory=list, converter=_glob_filepaths)
     
     def as_markdown(self) -> str:
       ansi_result = self.process.stdout + self.process.stderr
@@ -320,7 +328,7 @@ class MailSender:
          # Attachments
         for item in report.items:
           for f in item.output_files:
-            # Read the WPSCan output
+            # Read the output
             attachment = io.BytesIO(f.read_bytes())
             part = MIMEApplication(attachment.read(), Name=f.name)
             # Add header as key/value pair to attachment part
@@ -349,8 +357,7 @@ Secuity scans are the main usage.
     parser.add_argument('--arg', '-a', metavar="KEY=VALUE", help="Extra interpolation arguments", action="extend", nargs="+", default=[])
     parser.add_argument('--mailto', '-m', metavar="EMAIL", help="Send report by email to recipient(s).", action="extend", nargs="+")
     parser.add_argument('--output', '-o', metavar="PATH", help="Save report to HTML file. Default to report.html", 
-                        default='report.html', type=argparse.FileType('w', encoding='UTF-8'))
-    
+                        default='report.html', type=argparse.FileType('w', encoding='utf-8'))
     return  parser
 
 def get_extra_arguments(raw_extra_args: List[str]) -> Dict[str, str]:
@@ -358,20 +365,19 @@ def get_extra_arguments(raw_extra_args: List[str]) -> Dict[str, str]:
   for arg in raw_extra_args:
     parsed = arg.split("=", 1)
     if len(parsed) != 2:
-      print(f"Cannot parse extra interpolation argument: '{arg}'. Should be like 'KEY=VALUE'")
-      continue
+      error(f"cannot parse interpolation argument: '{arg}'. Should be like 'KEY=VALUE'")
     key, value = parsed
     extra_args[key] = value
   return extra_args
 
-def get_enabled_tools(configured_tools:Dict[str, Any], remainings_args: Iterable[str]) -> List[str]:
+def get_enabled_tools(configured_tools:Dict[str, Any], remainings_args: Iterable[str]) -> Sequence[str]:
   """
   Manually handled arguments to figure which tools are enabled based on flags. 
   """
   remainings_no_dash = [r.replace('-', '') for r in remainings_args]
 
-  enabled_tools: Iterable[str] = [ t for t in remainings_no_dash if t in configured_tools.keys()]
-  invalid_tools: Iterable[str]  = [ t for t in remainings_no_dash if t not in configured_tools.keys()]
+  enabled_tools: List[str] = [ t for t in remainings_no_dash if t in configured_tools.keys()]
+  invalid_tools: List[str]  = [ t for t in remainings_no_dash if t not in configured_tools.keys()]
 
   # Handle the '--all --no-wpscan' arguments for exemple
   if 'all' in invalid_tools:
@@ -401,23 +407,20 @@ def main():
     
     # Fail fast
     if not configured_tools:
-      print("Error: At least one tool must be configured. i.e. :\n[--nikto]\ndescription = Nikto web server scanner\ncommand = nikto -h $url")
-      exit(1)
+      error("at least one tool must be configured. i.e. :\n[--nikto]\ndescription = Nikto web server scanner\ncommand = nikto -h $url")
     else:
       print(f"Configured tools: {', '.join(configured_tools.keys())}")
 
     # Fail fast
     if not args.url:
-      print("Error: No URL supplied, supply URL with --url <url>")
-      exit(1)
+      error("no URL supplied, supply URL with --url <url>")
 
     enabled_tools: List[str] = get_enabled_tools(configured_tools, remainings)
 
     # Fail fast
     if not enabled_tools:
-      print(f"Error: At least one tool must be enable: use --<tool>. i.e.: --{next(iter(configured_tools))}.\n"
+      error(f"at least one tool must be enable: use --<tool>. i.e.: --{next(iter(configured_tools))}.\n"
         "You can also use --al and --no-<tool> flags. ")
-      exit(1)
 
     else:
       print(f"Enabled tools: {' '.join(enabled_tools) if enabled_tools!=list(configured_tools) else 'all'}")
@@ -430,18 +433,23 @@ def main():
 
     extra_args = get_extra_arguments(args.arg)
 
-    timeout_seconds = parse_timedelta(config['general'].get('scan_timeout', '4h')).total_seconds()
+    processes: List[Process] = []
 
     for tool in enabled_tools:
        
-        process = Process(  command=configured_tools[tool]['command'].strip(), 
-                            timeout_seconds=timeout_seconds,
-                            popen_args=configured_tools[tool].get('popen_args', '{}') )
+        process = Process.new(command=configured_tools[tool]['command'].strip(), 
+                              interpolations=dict(url=args.url, **extra_args),
+                              timeout=config['general'].get('scan_timeout', '4h'),
+                              popen_args=json.loads(configured_tools[tool].get('popen_args', '{}')))
 
-        completed_p = process.run(url=args.url, **extra_args)
+        processes.append(process)
+    
+    for process in processes:
+
+        completed_p = process.run()
       
         report_items.append(ReportItem( process=completed_p,
-                                        description=configured_tools[tool]['description'],
+                                        description=configured_tools[tool].get('description', 'Security scans'),
                                         output_files=configured_tools[tool].get('output_files', '').strip().splitlines() ))
 
     report = Report( items=report_items, title=config['general']['title'], 

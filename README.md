@@ -10,6 +10,8 @@ Install
 
     pip install -r requirements.txt
 
+Requires Python3.7 or later. 
+
 Configure scripts with a config file: 
 
 ```ini
@@ -70,7 +72,7 @@ You can use `--all` combined with `--no-<tool>` to run all configured tools and 
 Save the HTML report to file with the `--output` option. Default is `./report.html`, use `-` to indicate stdout. 
 
 Additionaly, arbitrary interpolation values can be added to the scripts. This can be useful to configure authentication. 
-The values should be supplied by arguments like `--arg KEY=VALUE`. 
+The values should be supplied by arguments like `--arg KEY=VALUE`. The values will be replaced with asterixes in the emails for confidentiality. 
 
 ```
 ./scan.py -c config.ini --mailto me@gmail.com --url http://exemple.com --wpscan --arg wpscan-api-token=xxx
