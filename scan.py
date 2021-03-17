@@ -433,24 +433,26 @@ def main():
 
     extra_args = get_extra_arguments(args.arg)
 
-    processes: List[Process] = []
+    enabled_tools_map: Dict[str, Optional[Process]] = {tool: None for tool in enabled_tools}
 
-    for tool in enabled_tools:
+    for tool in enabled_tools_map:
        
         process = Process.new(command=configured_tools[tool]['command'].strip(), 
                               interpolations=dict(url=args.url, **extra_args),
                               timeout=config['general'].get('scan_timeout', '4h'),
                               popen_args=json.loads(configured_tools[tool].get('popen_args', '{}')))
 
-        processes.append(process)
+        enabled_tools_map[tool] = process
     
-    for process in processes:
-
-        completed_p = process.run()
-      
-        report_items.append(ReportItem( process=completed_p,
-                                        description=configured_tools[tool].get('description', 'Security scans'),
-                                        output_files=configured_tools[tool].get('output_files', '').strip().splitlines() ))
+    for tool in enabled_tools_map:
+        
+        if enabled_tools_map[tool]:
+          
+          completed_p = enabled_tools_map[tool].run()
+        
+          report_items.append(ReportItem( process=completed_p,
+                                          description=configured_tools[tool].get('description', 'Security scans'),
+                                          output_files=configured_tools[tool].get('output_files', '').strip().splitlines() ))
 
     report = Report( items=report_items, title=config['general']['title'], 
                      url=args.url, datetime=datetime.now().isoformat(timespec='seconds') )
