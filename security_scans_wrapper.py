@@ -196,7 +196,7 @@ class Report:
   items: Iterable[ReportItem]
   title: str
   url: str
-  datetime: str # = datetime.now().isoformat(timespec='seconds')
+  datetime: str
 
   def _as_markdown(self) -> str:
     md = f"# {self.title} - {self.url} - {self.datetime}\n"
