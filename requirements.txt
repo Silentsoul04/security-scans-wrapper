@@ -1,4 +1,0 @@
-attrs
-markdown
-pymdown-extensions
-ansi2html

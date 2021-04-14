@@ -6,8 +6,7 @@ Secuity scans are the main usage.
 """
 
 import sys
-import subprocess
-from typing import Sequence, TYPE_CHECKING, Dict, Any, Iterable, List, Optional, Tuple, Callable, NoReturn
+from typing import Optional, Sequence, Dict, Any, Iterable, List
 import smtplib
 import json
 import argparse
@@ -15,18 +14,15 @@ import configparser
 import functools
 import pathlib
 import io
-import os
 import re
-import signal
 import glob
 import shlex
-import queue
-import threading
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
 from email.mime.text import MIMEText
 
+import invoke
 import attr
 import markdown
 from ansi2html import Ansi2HTMLConverter
@@ -51,63 +47,32 @@ def parse_timedelta(time_str: str) -> timedelta:
     }
     return timedelta(**time_params)  # type: ignore [arg-type]
 
-def func_timeout(
-    timeout: float,
-    func: Callable[..., Any],
-    args: Tuple[Any, ...] = (),
-    kwargs: Dict[str, Any] = {},
-    ) -> Any:
-    """Run func with the given timeout.
-    :raise TimeoutError: If func didn't finish running within the given timeout.
-    """
-
-    class FuncThread(threading.Thread):
-        def __init__(self, bucket: queue.Queue) -> None:  # type: ignore [type-arg]
-            threading.Thread.__init__(self)
-            self.result: Any = None
-            self.bucket: queue.Queue = bucket  # type: ignore [type-arg]
-            self.err: Optional[Exception] = None
-            self.daemon = True # die when the main thread dies
-
-        def run(self) -> None:
-            try:
-                self.result = func(*args, **kwargs)
-            except Exception as err:
-                self.bucket.put(sys.exc_info())
-                self.err = err
-
-    bucket: queue.Queue = queue.Queue()  # type: ignore [type-arg]
-    it = FuncThread(bucket)
-    it.start()
-    it.join(timeout)
-    if it.is_alive():
-        raise TimeoutError()
-    else:
-        try:
-            _, _, exc_trace = bucket.get(block=False)
-        except queue.Empty:
-            return it.result
-        else:
-            raise it.err.with_traceback(exc_trace)  # type: ignore [union-attr]
-
-def error(msg: str) -> NoReturn:
+def error(msg: str) -> None:
     print(f"ERROR: {msg}")
-    exit(1)
+    sys.exit(1)
+
+@attr.s(auto_attribs=True)
+class ProcessResult:
+  stdout: str
+  stderr: str
+  command: str # not the actual command
+  returncode: Optional[int] = 0
+  failure: Optional[str] = None
+
+def _parse_timedelta_seconds(string: str) -> int:
+    return int(parse_timedelta(string).total_seconds())
 
 @attr.s(auto_attribs=True)
 class Process:
   """
   Run arbitrary commands with subprocess from string command with string interpolations and popen args as JSON. 
   """
-  command: str = attr.ib() # not the actual command
-  popen: subprocess.Popen = attr.ib()
-  timeout: int = attr.ib(converter=lambda x: parse_timedelta(x).total_seconds())
-  popen_args: Dict[str, Any] = attr.ib(factory=list)
+  command: str # not the actual command
+  real_command: str # the "real" command, one that will be run by invoke.run()
+  timeout: int
  
   @classmethod
-  def new(cls, command: str, interpolations: Dict[str, str], 
-          timeout: str, popen_args: Dict[str, Any]):
-    
+  def new(cls, command: str, interpolations: Dict[str, str], timeout: str) -> 'Process': 
     """Create a new process with the given interpolation parameters."""
     # substitute interpolations
     cmd = cls._interpolate_real(command, **interpolations)
@@ -115,30 +80,18 @@ class Process:
     # fail if missing place holders
     cls._check_interpolation_leftovers(cmd)
 
-    is_shell = popen_args.get('shell', False)
-    
-    # cast command to right format depending shell = True
-    _cmd = shlex.split(cmd) if not is_shell else cmd
-    
-    if is_shell:
-      # https://stackoverflow.com/questions/4789837/how-to-terminate-a-python-subprocess-launched-with-shell-true
-      popen_args.update(dict(preexec_fn=os.setsid))
-    
-    popen = subprocess.Popen(
-      _cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **popen_args)
-
     return cls(command=cls._interpolate_no_values(command, **interpolations), 
-               popen=popen, timeout=timeout, popen_args=popen_args)
+              real_command=cmd, timeout=_parse_timedelta_seconds(timeout))
 
   @staticmethod
-  def _interpolate_real(cmd: str, **kwargs) -> str:
+  def _interpolate_real(cmd: str, **kwargs: Any) -> str:
     for k,v in kwargs.items():
       if '{{%s}}'%k in cmd:
         cmd = cmd.replace('{{%s}}'%k, shlex.quote(v))
     return cmd
 
   @staticmethod
-  def _interpolate_no_values(cmd: str, **kwargs) -> str:
+  def _interpolate_no_values(cmd: str, **kwargs: Any) -> str:
     for k,v in kwargs.items():
       if k == 'url':
         if '{{%s}}'%k in cmd:
@@ -157,35 +110,24 @@ class Process:
       error("the following place holders could not get interpolated: " 
         f"{', '.join(all_leftovers_placeholder)}. Use --arg KEY=VALUE to pass values.")
 
-  def kill(self) -> None:
-    """Kill the process"""
-    assert self.popen is not None
-    if self.popen_args.get('shell', False):
-      os.kill(os.getpgid(self.popen.pid), signal.SIGKILL)
-    else:
-      os.kill(self.popen.pid, signal.SIGKILL)
-
-  def run(self) -> subprocess.CompletedProcess:
+  def run(self) -> ProcessResult:
     """Run the process."""
     
-    # the actual command
-    print(f"Running: '{self.popen.args}'\n(Popen arguments: {self.popen_args})")
+    # The actual command
+    print(f"Running: '{self.real_command}'")
 
     try:
-      stdout, stderr = func_timeout(timeout=self.timeout, func=self.popen.communicate)
-    except TimeoutError:
-      self.kill()
-      print(f"Timeout reached after {self.timeout} seconds for process {self.popen.pid} while running: '{self.popen.args}'")
-      stdout, stderr = f"The command timed out after {self.timeout} seconds. Configure 'scan_timeout' to allow more time.", ""
-    except KeyboardInterrupt:
-      self.kill()
-      raise
+      result = invoke.run(command=self.real_command, timeout=self.timeout, pty=True, out_stream=sys.stderr)
+      return ProcessResult(stdout=result.stdout, stderr=result.stderr, command=self.command)
 
-    return subprocess.CompletedProcess(
-        args = self.command, 
-        returncode = self.popen.returncode, 
-        stdout = stdout, 
-        stderr = stderr)
+    except invoke.exceptions.CommandTimedOut as err:
+      return ProcessResult(stdout=err.result.stdout, stderr=err.result.stderr, command=self.command, 
+          returncode=None, failure=f"Command timed out after {self.timeout} seconds. Configure 'scan_timeout' to allow more time.")
+
+    except invoke.exceptions.UnexpectedExit as err:
+      return ProcessResult(stdout=err.result.stdout, stderr=err.result.stderr, command=self.command, 
+          returncode=err.result.exited, 
+          failure=f"Command encountered a bad exit code: {err.result.exited}.")
 
 def _glob_filepaths(files: List[str]) -> List[pathlib.Path]:
     # find output files with globbing if any
@@ -210,27 +152,30 @@ def _glob_filepaths(files: List[str]) -> List[pathlib.Path]:
 @attr.s(auto_attribs=True, frozen=True)
 class ReportItem:
     """
-    Transform a process CompletedProcess object to pseudo markdown/HTML.
+    Transform a process ProcessResult object to pseudo markdown/HTML.
 
     Strore output files as Path. 
     """
 
-    process: subprocess.CompletedProcess
+    process: ProcessResult
     description: str  
     output_files: List[pathlib.Path] = attr.ib(factory=list, converter=_glob_filepaths)
     
     def as_markdown(self) -> str:
-      ansi_result = self.process.stdout + self.process.stderr
+      ansi_result = self.process.stdout or '' + self.process.stderr or ''
       output_files = "" if not self.output_files else f"_Output file(s): {', '.join(f.name for f in self.output_files)}_"
+      failure_infos = f"""!!! error\n    {self.process.failure}""" if self.process.failure else ''
       newline = '\n'
       return f"""
 ## {self.description}
 
 <code>
-{self.process.args.replace(newline, '<br />')}
+{self.process.command.replace(newline, '<br />')}
 </code>
 
 <strong>Result</strong> <br />
+
+{failure_infos}
 
 <div class="body_foreground body_background" style="font-size: 10;" >
 <pre class="ansi2html-content">
@@ -263,7 +208,8 @@ class Report:
   def as_html(self) -> str:
     html = markdown.markdown(self._as_markdown(), 
       extensions=['pymdownx.highlight', 'pymdownx.superfences', 
-                  'pymdownx.details', 'pymdownx.magiclink', 'markdown.extensions.toc'])
+                  'pymdownx.details', 'pymdownx.magiclink', 
+                  'markdown.extensions.toc', 'markdown.extensions.admonition'])
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -395,7 +341,7 @@ def get_enabled_tools(configured_tools:Dict[str, Any], remainings_args: Iterable
   return enabled_tools
 
 
-def main():
+def main() -> None:
     parser = get_arg_parser()
     args, remainings = parser.parse_known_intermixed_args()
 
@@ -415,7 +361,7 @@ def main():
     if not args.url:
       error("no URL supplied, supply URL with --url <url>")
 
-    enabled_tools: List[str] = get_enabled_tools(configured_tools, remainings)
+    enabled_tools: Sequence[str] = get_enabled_tools(configured_tools, remainings)
 
     # Fail fast
     if not enabled_tools:
@@ -429,30 +375,29 @@ def main():
     if 'mail' in config:
       mailsender = MailSender(**config['mail'])
 
-    report_items: Iterable[ReportItem] = list()
+    report_items: List[ReportItem] = []
 
     extra_args = get_extra_arguments(args.arg)
 
-    enabled_tools_map: Dict[str, Optional[Process]] = {tool: None for tool in enabled_tools}
+    process_tools_map: Dict[str, Process] = {}
 
-    for tool in enabled_tools_map:
+    for tool in enabled_tools:
        
         process = Process.new(command=configured_tools[tool]['command'].strip(), 
                               interpolations=dict(url=args.url, **extra_args),
-                              timeout=config['general'].get('scan_timeout', '4h'),
-                              popen_args=json.loads(configured_tools[tool].get('popen_args', '{}')))
+                              timeout=config['general'].get('scan_timeout', '24h'),)
 
-        enabled_tools_map[tool] = process
+        process_tools_map[tool] = process
     
-    for tool in enabled_tools_map:
+    for tool_name, process in process_tools_map.items():
         
-        if enabled_tools_map[tool]:
+        if process:
           
-          completed_p = enabled_tools_map[tool].run()
+          process_result = process.run()
         
-          report_items.append(ReportItem( process=completed_p,
-                                          description=configured_tools[tool].get('description', 'Security scans'),
-                                          output_files=configured_tools[tool].get('output_files', '').strip().splitlines() ))
+          report_items.append(ReportItem( process=process_result,
+                                          description=configured_tools[tool_name].get('description', 'Security scans'),
+                                          output_files=configured_tools[tool_name].get('output_files', '').strip().splitlines() ))
 
     report = Report( items=report_items, title=config['general']['title'], 
                      url=args.url, datetime=datetime.now().isoformat(timespec='seconds') )
