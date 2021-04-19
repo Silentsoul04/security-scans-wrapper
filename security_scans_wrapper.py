@@ -7,7 +7,7 @@ Secuity scans are the main usage.
 
 import os
 import sys
-from typing import Optional, Sequence, Dict, Any, Iterable, List
+from typing import Callable, Optional, Sequence, Dict, Any, Iterable, List
 import smtplib
 import json
 import argparse
@@ -31,7 +31,7 @@ import markdown
 from ansi2html import Ansi2HTMLConverter
 ansi2HTMLconverter = Ansi2HTMLConverter(inline=True, linkify=True)
 
-print = functools.partial(print, file=sys.stderr)
+print: Callable[[Any], None] = functools.partial(print, file=sys.stderr)
 
 # stolen
 STYLE =   """<style>
@@ -107,6 +107,11 @@ def error(msg: str) -> None:
 
 @attr.s(auto_attribs=True)
 class ProcessResult:
+  process: 'Process'
+  """
+  The Process that created this ProcessResult.
+  """
+
   stdout: str
   stderr: str
   command: str # not the actual command
@@ -124,6 +129,7 @@ class Process:
   command: str # not the actual command
   real_command: str # the "real" command, one that will be run by invoke.run()
   timeout: int
+  interpolations: Dict[str, str]
  
   @classmethod
   def new(cls, command: str, interpolations: Dict[str, str], timeout: str) -> 'Process': 
@@ -135,7 +141,7 @@ class Process:
     cls._check_interpolation_leftovers(cmd)
 
     return cls(command=cls._interpolate_no_values(command, **interpolations), 
-              real_command=cmd, timeout=_parse_timedelta_seconds(timeout))
+              real_command=cmd, timeout=_parse_timedelta_seconds(timeout), interpolations=interpolations)
 
   @staticmethod
   def _interpolate_real(cmd: str, **kwargs: Any) -> str:
@@ -172,15 +178,15 @@ class Process:
 
     try:
       result = invoke.run(command=self.real_command, timeout=self.timeout, pty=True, out_stream=sys.stderr)
-      return ProcessResult(stdout=result.stdout, stderr=result.stderr, command=self.command)
+      return ProcessResult(stdout=result.stdout, stderr=result.stderr, command=self.command, process=self)
 
     except invoke.exceptions.CommandTimedOut as err:
-      return ProcessResult(stdout=err.result.stdout, stderr=err.result.stderr, command=self.command, 
+      return ProcessResult(stdout=err.result.stdout, stderr=err.result.stderr, command=self.command, process=self,
           returncode=None, failure=f"Command timed out after {self.timeout} seconds. Configure 'scan_timeout' to allow more time.")
 
     except invoke.exceptions.UnexpectedExit as err:
       return ProcessResult(stdout=err.result.stdout, stderr=err.result.stderr, command=self.command, 
-          returncode=err.result.exited, 
+          returncode=err.result.exited, process=self,
           failure=f"Command encountered a bad exit code: {err.result.exited}.")
 
 def _glob_filepaths(files: List[str]) -> List[pathlib.Path]:
@@ -211,7 +217,12 @@ class ReportItem:
     Strore output files as Path. 
     """
 
-    process: ProcessResult
+    result: ProcessResult
+
+    report: 'Report'
+    """
+    Link to the report that contains the items. 
+    """
     description: str  
 
     process_output_html: str
@@ -230,39 +241,49 @@ class ReportItem:
     """
 
     @classmethod
-    def new(cls, process: ProcessResult,  truncate_output: int, description: str, output_files: List[str]) -> 'ReportItem':
+    def new(cls, result: ProcessResult,  truncate_output: int, description: str, output_files: List[str], report: 'Report') -> 'ReportItem':
       
-      ansi_result = process.stdout or '' + process.stderr or ''
+      ansi_result = result.stdout or '' + result.stderr or ''
 
       process_output_html: str
       full_process_output_html_file: Optional[pathlib.Path] = None
 
       # Truncate output if need be.
       if len(ansi_result) > truncate_output:
-        process_output_html = ansi2HTMLconverter.convert(ansi_result[:truncate_output], full=False)
+        process_output_html = ansi2HTMLconverter.convert('...' + 
+          # in the HTML email, Shows the tail of the result only. 
+          ansi_result[len(ansi_result)-truncate_output:len(ansi_result)], full=False)
+        
         full_process_output_html = ansi2HTMLconverter.convert(ansi_result, full=True)
+        
+        # Create temp dir
         full_process_output_html_file = pathlib.Path(tempfile.gettempdir() + os.sep + 
-            'security-scans-wrapper-temp' + os.sep + get_valid_filename(description) + '.txt')
+            'security-scans-wrapper-temp' + os.sep + 
+            get_valid_filename('_'.join([description, result.process.interpolations['url'], report.datetime]) + '.txt'))
+        
         os.makedirs(full_process_output_html_file.parent, exist_ok=True)
         if full_process_output_html_file.exists():
               os.remove(full_process_output_html_file)
+
+        # Store the full output in the temp file.
         with full_process_output_html_file.open('w', encoding='utf-8') as f:
           f.write(full_process_output_html)
       
       else:
         process_output_html = ansi2HTMLconverter.convert(ansi_result, full=False)
       
-      return ReportItem(process=process, description=description, output_files=_glob_filepaths(output_files), 
+      return ReportItem(result=result, description=description, output_files=_glob_filepaths(output_files), 
                         process_output_html=process_output_html, 
-                        full_process_output_html_file=full_process_output_html_file)
+                        full_process_output_html_file=full_process_output_html_file,
+                        report=report)
     
     def as_markdown(self) -> str:
       output_filenames = (f"`{f.name}`" for f in self.output_files)
       output_files = "" if not self.output_files else f"""!!! note "Output file{'s' if len(self.output_files) >= 2 else ''} attached"\n    {', '.join(output_filenames)}"""
-      failure_infos = f"""!!! error\n    {self.process.failure}""" if self.process.failure else ''
-      truncate_infos = f"""!!! warning\n    The output has been truncated, please refer to the attached file `{self.full_process_output_html_file.name}` to review the full log.""" if self.full_process_output_html_file else ''
+      failure_infos = f"""!!! error\n    {self.result.failure}""" if self.result.failure else ''
+      truncate_infos = f"""!!! warning\n    The output has been truncated, refer to the attached file `{self.full_process_output_html_file.name}` to review the full log.""" if self.full_process_output_html_file else ''
       
-      command = self.process.command.replace('\n', '<br />')
+      command = self.result.command.replace('\n', '<br />')
       
       return f"""
 ## {self.description}
@@ -281,8 +302,6 @@ class ReportItem:
 
 {output_files}
 
-<strong>Output</strong> <br />
-
 <div class="body_foreground body_background" style="font-size: 10;" >
 <pre class="ansi2html-content">
 
@@ -300,10 +319,10 @@ class Report:
   Transform a collection of ReportItem into a HTML document. 
   """
 
-  items: Iterable[ReportItem]
   title: str
   url: str
   datetime: str
+  items: List[ReportItem] = attr.ib(factory=list)
 
   def _as_markdown(self) -> str:
     md = f"# {self.title} - {self.url} - {self.datetime}\n"
@@ -492,19 +511,20 @@ def main() -> None:
     if 'mail' in config:
       mailsender = MailSender(**config['mail'])
 
-    report_items: List[ReportItem] = []
-
     extra_args = get_extra_arguments(args.arg)
 
     process_tools_map: Dict[str, Process] = {}
 
     for tool in enabled_tools:
-       
+    
         process = Process.new(command=configured_tools[tool]['command'].strip(), 
                               interpolations=dict(url=args.url, **extra_args),
                               timeout=config['general'].get('scan_timeout', '24h'),)
 
         process_tools_map[tool] = process
+    
+    report = Report(title=config['general']['title'], 
+                     url=args.url, datetime=datetime.now().isoformat(timespec='seconds') )
     
     for tool_name, process in process_tools_map.items():
         
@@ -512,13 +532,12 @@ def main() -> None:
           
           process_result = process.run()
         
-          report_items.append(ReportItem.new( process=process_result, 
+          report.items.append(ReportItem.new( result=process_result, report=report,
                                           truncate_output=int(config['general'].get('truncate_output', '10000')),
                                           description=configured_tools[tool_name].get('description', 'Security scans'),
                                           output_files=configured_tools[tool_name].get('output_files', '').strip().splitlines() ))
 
-    report = Report( items=report_items, title=config['general']['title'], 
-                     url=args.url, datetime=datetime.now().isoformat(timespec='seconds') )
+    
 
     if args.mailto:
       if mailsender:
