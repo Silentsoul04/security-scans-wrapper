@@ -5,6 +5,7 @@ Generates a HTML document and can send reports by email.
 Secuity scans are the main usage. 
 """
 
+import os
 import sys
 from typing import Optional, Sequence, Dict, Any, Iterable, List
 import smtplib
@@ -17,6 +18,8 @@ import io
 import re
 import glob
 import shlex
+import tempfile
+import string
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
@@ -29,6 +32,52 @@ from ansi2html import Ansi2HTMLConverter
 ansi2HTMLconverter = Ansi2HTMLConverter(inline=True, linkify=True)
 
 print = functools.partial(print, file=sys.stderr)
+
+# stolen
+STYLE =   """<style>
+
+/* Admonitions */
+
+div.admonition p.admonition-title:after {
+    content: ":";
+}
+
+div.admonition p.admonition-title {
+    margin: 0;
+    font-weight: bold;
+}
+
+div.admonition p.admonition-title {
+    color: #333333;
+}
+
+div.admonition {
+    padding: 3px;
+    margin-bottom: 20px;
+    background-color: #EEE;
+    border: 1px solid #CCC;
+    border-radius: 4px;
+}
+
+div.warning, div.attention, div.danger, div.error, div.caution {
+    background-color: #ffcf9cb0;
+    border: 1px solid #ffbbaa;
+}
+
+div.danger p.admonition-title, div.error p.admonition-title, div.caution p.admonition-title {
+    color: #b94a48;
+}
+
+div.tip p.admonition-title, div.hint p.admonition-title, div.important p.admonition-title{
+    color: #3a87ad;
+}
+
+div.tip, div.hint, div.important {
+    background-color: #d9edf7;
+    border-color: #bce8f1;
+}
+  </style>
+  """
 
 def parse_timedelta(time_str: str) -> timedelta:
     """
@@ -46,6 +95,11 @@ def parse_timedelta(time_str: str) -> timedelta:
         name: float(param) for name, param in parts.groupdict().items() if param
     }
     return timedelta(**time_params)  # type: ignore [arg-type]
+
+def get_valid_filename(s: str) -> str:
+    '''Return the given string converted to a string that can be used for a clean filename.  Stolen from Django I think'''
+    s = str(s).strip().replace(' ', '_')
+    return re.sub(r'(?u)[^-\w.]', '', s)
 
 def error(msg: str) -> None:
     print(f"ERROR: {msg}")
@@ -159,31 +213,84 @@ class ReportItem:
 
     process: ProcessResult
     description: str  
-    output_files: List[pathlib.Path] = attr.ib(factory=list, converter=_glob_filepaths)
+
+    process_output_html: str
+    """
+    Process stdout encoded as HTML, truncated if full_process_output_file is not None. 
+    """
+    
+    output_files: List[pathlib.Path] = attr.ib(factory=list)
+    """
+    Generated output files.
+    """
+
+    full_process_output_html_file: Optional[pathlib.Path] = None
+    """
+    This is used to store the full output when it must be truncated. None if stdout is small enough. 
+    """
+
+    @classmethod
+    def new(cls, process: ProcessResult,  truncate_output: int, description: str, output_files: List[str]) -> 'ReportItem':
+      
+      ansi_result = process.stdout or '' + process.stderr or ''
+
+      process_output_html: str
+      full_process_output_html_file: Optional[pathlib.Path] = None
+
+      # Truncate output if need be.
+      if len(ansi_result) > truncate_output:
+        process_output_html = ansi2HTMLconverter.convert(ansi_result[:truncate_output], full=False)
+        full_process_output_html = ansi2HTMLconverter.convert(ansi_result, full=True)
+        full_process_output_html_file = pathlib.Path(tempfile.gettempdir() + os.sep + 
+            'security-scans-wrapper-temp' + os.sep + get_valid_filename(description) + '.txt')
+        os.makedirs(full_process_output_html_file.parent, exist_ok=True)
+        if full_process_output_html_file.exists():
+              os.remove(full_process_output_html_file)
+        with full_process_output_html_file.open('w', encoding='utf-8') as f:
+          f.write(full_process_output_html)
+      
+      else:
+        process_output_html = ansi2HTMLconverter.convert(ansi_result, full=False)
+      
+      return ReportItem(process=process, description=description, output_files=_glob_filepaths(output_files), 
+                        process_output_html=process_output_html, 
+                        full_process_output_html_file=full_process_output_html_file)
     
     def as_markdown(self) -> str:
-      ansi_result = self.process.stdout or '' + self.process.stderr or ''
-      output_files = "" if not self.output_files else f"_Output file(s): {', '.join(f.name for f in self.output_files)}_"
+      output_filenames = (f"`{f.name}`" for f in self.output_files)
+      output_files = "" if not self.output_files else f"""!!! note "Output file{'s' if len(self.output_files) >= 2 else ''} attached"\n    {', '.join(output_filenames)}"""
       failure_infos = f"""!!! error\n    {self.process.failure}""" if self.process.failure else ''
-      newline = '\n'
+      truncate_infos = f"""!!! warning\n    The output has been truncated, please refer to the attached file `{self.full_process_output_html_file.name}` to review the full log.""" if self.full_process_output_html_file else ''
+      
+      command = self.process.command.replace('\n', '<br />')
+      
       return f"""
 ## {self.description}
 
+<strong>Command</strong> <br />
+
 <code>
-{self.process.command.replace(newline, '<br />')}
+{command}
 </code>
 
 <strong>Result</strong> <br />
 
 {failure_infos}
 
+{truncate_infos}
+
+{output_files}
+
+<strong>Output</strong> <br />
+
 <div class="body_foreground body_background" style="font-size: 10;" >
 <pre class="ansi2html-content">
-{ansi2HTMLconverter.convert(ansi_result, full=False)}
+
+{self.process_output_html}
+
 </pre>
 </div>
 
-{output_files}
 """
 
 
@@ -210,18 +317,24 @@ class Report:
       extensions=['pymdownx.highlight', 'pymdownx.superfences', 
                   'pymdownx.details', 'pymdownx.magiclink', 
                   'markdown.extensions.toc', 'markdown.extensions.admonition'])
-    return f"""<!DOCTYPE html>
+    return string.Template("""<!DOCTYPE html>
 <html>
 <head>
-{ansi2HTMLconverter.produce_headers()}
+
+  $ansi_headers
+
+  $style
+
 </head>
 <body>
-<div class="container">
-{html}
-</div>
+  <div class="container">
+
+    $html
+
+  </div>
 </body>
 </html>
-"""
+""").substitute(ansi_headers=ansi2HTMLconverter.produce_headers(), style=STYLE, html=html)
 
 
 @attr.s(auto_attribs=True, frozen=True)
@@ -273,7 +386,11 @@ class MailSender:
 
          # Attachments
         for item in report.items:
-          for f in item.output_files:
+          files = item.output_files
+          # Add the extra output file if the log is big.
+          if item.full_process_output_html_file:
+                files.insert(0, item.full_process_output_html_file)
+          for f in files:
             # Read the output
             attachment = io.BytesIO(f.read_bytes())
             part = MIMEApplication(attachment.read(), Name=f.name)
@@ -395,7 +512,8 @@ def main() -> None:
           
           process_result = process.run()
         
-          report_items.append(ReportItem( process=process_result,
+          report_items.append(ReportItem.new( process=process_result, 
+                                          truncate_output=int(config['general'].get('truncate_output', '10000')),
                                           description=configured_tools[tool_name].get('description', 'Security scans'),
                                           output_files=configured_tools[tool_name].get('output_files', '').strip().splitlines() ))
 
@@ -415,6 +533,14 @@ def main() -> None:
     args.output.write(report.as_html())
 
     print(f"HTML report wrote to: '{args.output.name}'")
+
+    # Cleanup temp files
+    for item in report.items:
+      if item.full_process_output_html_file:
+        try:
+          os.remove(item.full_process_output_html_file)
+        except IOError: 
+          pass
 
     exit(0)
 

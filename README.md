@@ -17,7 +17,8 @@ Configure scripts with a config file:
 ```ini
 [general]
 title = Security scans
-scan_timeout = 4h
+scan_timeout = 24h
+truncate_output = 10000
 
 [mail]
 from_email=me@gmail.com
