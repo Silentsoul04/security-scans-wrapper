@@ -27,7 +27,7 @@ smtp_auth=false
 smtp_user=me@gmail.com
 smtp_pass=P@assW0rd
 smtp_ssl=true
-
+max_attachments_size = 26214400 # Will zip files together if the size is greater than 25MB
 
 [--nikto]
 description = Nikto - Web server scanner

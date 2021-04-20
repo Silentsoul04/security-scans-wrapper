@@ -20,6 +20,7 @@ import glob
 import shlex
 import tempfile
 import string
+import zipfile
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
@@ -32,6 +33,9 @@ from ansi2html import Ansi2HTMLConverter
 ansi2HTMLconverter = Ansi2HTMLConverter(inline=True, linkify=True)
 
 print: Callable[[Any], None] = functools.partial(print, file=sys.stderr)
+
+TEMP_DIR = pathlib.Path(tempfile.gettempdir() + os.sep + 'security-scans-wrapper-temp')
+
 
 # stolen
 STYLE =   """<style>
@@ -256,12 +260,10 @@ class ReportItem:
         
         full_process_output_html = ansi2HTMLconverter.convert(ansi_result, full=True)
         
-        # Create temp dir
-        full_process_output_html_file = pathlib.Path(tempfile.gettempdir() + os.sep + 
-            'security-scans-wrapper-temp' + os.sep + 
-            get_valid_filename('_'.join([description, result.process.interpolations['url'], report.datetime]) + '.txt'))
+        # Create temp file
+        full_process_output_html_file = (TEMP_DIR / get_valid_filename('_'.join([description, result.process.interpolations['url'], report.datetime]) + '.txt'))
         
-        os.makedirs(full_process_output_html_file.parent, exist_ok=True)
+        
         if full_process_output_html_file.exists():
               os.remove(full_process_output_html_file)
 
@@ -312,8 +314,8 @@ class ReportItem:
 
 """
 
-
-@attr.s(auto_attribs=True, frozen=True)
+# Need frozen=False because we're setting attachment_files_zipped from the MailSender
+@attr.s(auto_attribs=True, frozen=False)
 class Report:
   """
   Transform a collection of ReportItem into a HTML document. 
@@ -323,12 +325,15 @@ class Report:
   url: str
   datetime: str
   items: List[ReportItem] = attr.ib(factory=list)
+  attachment_files_zipped: bool = attr.ib(default=False)
 
   def _as_markdown(self) -> str:
     md = f"# {self.title} - {self.url} - {self.datetime}\n"
     md += "[TOC]\n"
     for item in self.items:
       md += f"{item.as_markdown()}"
+    if self.attachment_files_zipped:
+      md += "\n!!! note\n    The attachment files were zipped to fit in the SMTP message size limit.\n\n"
     return md
 
   def as_html(self) -> str:
@@ -359,7 +364,7 @@ class Report:
 @attr.s(auto_attribs=True, frozen=True)
 class MailSender:
     """
-    Fire the email reports. 
+    Fire the email reports. Compress the attachments if need be. 
     """
 
     from_email: str
@@ -370,6 +375,8 @@ class MailSender:
     
     smtp_user: str = ""
     smtp_pass: str = ""
+
+    max_attachments_size: int = attr.ib(default=26214400, converter=int) # 25MB by default
 
     def _send_mail(self, message: MIMEMultipart, email_to: List[str]) -> None:
         """Raw sendmail"""
@@ -398,32 +405,66 @@ class MailSender:
         message["From"] = self.from_email
         message["To"] = ",".join(email_to)
 
-        # Email body
-        body = report.as_html()
+        
 
-        message.attach(MIMEText(body, "html"))
-
-         # Attachments
+        # Attachments
+        attachment_files: List[pathlib.Path] = []
         for item in report.items:
-          files = item.output_files
+          
           # Add the extra output file if the log is big.
           if item.full_process_output_html_file:
-                files.insert(0, item.full_process_output_html_file)
-          for f in files:
-            # Read the output
-            attachment = io.BytesIO(f.read_bytes())
-            part = MIMEApplication(attachment.read(), Name=f.name)
-            # Add header as key/value pair to attachment part
-            part.add_header(
-                "Content-Disposition",
-                f"attachment; filename={f.name}",
-            )
-            # Attach the report
-            message.attach(part)
+            attachment_files.append(item.full_process_output_html_file)
+          
+          # Output files
+          attachment_files.extend(item.output_files)
+        
+        # Check if the attachment_files are too big
+        total_size = 0 # in bytes
+        for f in attachment_files:
+          total_size += f.stat().st_size
+
+        zipped = False
+        if total_size>self.max_attachments_size:
+              
+          # The file size is too big, zipping alltogether
+          print("Compressing attachments...")
+          zip_file_path = (TEMP_DIR / get_valid_filename(f"{report.title}_{report.url}_{report.datetime}"))
+          with zipfile.ZipFile(zip_file_path, 'w', compression=zipfile.ZIP_DEFLATED) as zip:
+
+            for a in attachment_files:
+              zip.write(a.as_posix())
+
+          attachment_files = [zip_file_path]
+          zipped = True
+
+        # Store the value of zipped in the report
+        report.attachment_files_zipped = zipped
+
+        # Email body
+        body = report.as_html()
+        message.attach(MIMEText(body, "html"))
+
+        # Attach the attachment_files
+        for f in attachment_files:
+          # Read the output
+          attachment = io.BytesIO(f.read_bytes())
+          part = MIMEApplication(attachment.read(), Name=f.name)
+          # Add header as key/value pair to attachment part
+          part.add_header(
+              "Content-Disposition",
+              f"attachment; filename={f.name}",
+          )
+          # Attach the file
+          message.attach(part)
 
         # Connecting and sending
         self._send_mail(message, email_to)
         print(f"Mail sent: {message['Subject']} to {email_to}")
+
+        # Cleaning up 
+        if zipped:
+          for path in attachment_files:
+                os.remove(path)
 
 
 def get_arg_parser() -> argparse.ArgumentParser:
@@ -478,6 +519,8 @@ def get_enabled_tools(configured_tools:Dict[str, Any], remainings_args: Iterable
 
 
 def main() -> None:
+    os.makedirs(TEMP_DIR, exist_ok=True)
+
     parser = get_arg_parser()
     args, remainings = parser.parse_known_intermixed_args()
 
