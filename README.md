@@ -8,7 +8,7 @@ Generates a HTML document and can send reports by email for investigation.
 
 Install
 
-    pip install git+git@github.com:tristanlatr/security-scans-wrapper.git
+    pip install -U git+git@github.com:tristanlatr/security-scans-wrapper.git
 
 Requires Python3.7 or later. 
 
@@ -18,7 +18,7 @@ Configure scripts with a config file:
 [general]
 title = Security scans
 scan_timeout = 24h
-truncate_output = 10000
+truncate_output = 10000 # (chars)
 
 [mail]
 from_email=me@gmail.com
@@ -27,7 +27,7 @@ smtp_auth=false
 smtp_user=me@gmail.com
 smtp_pass=P@assW0rd
 smtp_ssl=true
-max_attachments_size = 26214400 # Will zip files together if the size is greater than 25MB
+max_attachments_size = 26214400 # (bytes) Will zip files together if the size is greater than 25MB
 
 [--nikto]
 description = Nikto - Web server scanner

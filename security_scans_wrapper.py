@@ -128,7 +128,7 @@ def _parse_timedelta_seconds(string: str) -> int:
 @attr.s(auto_attribs=True)
 class Process:
   """
-  Run arbitrary commands with subprocess from string command with string interpolations and popen args as JSON. 
+  Run shell script from string with arbitrary interpolations. 
   """
   command: str # not the actual command
   real_command: str # the "real" command, one that will be run by invoke.run()
@@ -261,8 +261,7 @@ class ReportItem:
         full_process_output_html = ansi2HTMLconverter.convert(ansi_result, full=True)
         
         # Create temp file
-        full_process_output_html_file = (TEMP_DIR / get_valid_filename('_'.join([description, result.process.interpolations['url'], report.datetime]) + '.txt'))
-        
+        full_process_output_html_file = (TEMP_DIR / get_valid_filename('_'.join([description, result.process.interpolations['url'], report.datetime]) + '.html'))
         
         if full_process_output_html_file.exists():
               os.remove(full_process_output_html_file)
@@ -314,8 +313,7 @@ class ReportItem:
 
 """
 
-# Need frozen=False because we're setting attachment_files_zipped from the MailSender
-@attr.s(auto_attribs=True, frozen=False)
+@attr.s(auto_attribs=True, frozen=True)
 class Report:
   """
   Transform a collection of ReportItem into a HTML document. 
@@ -325,15 +323,12 @@ class Report:
   url: str
   datetime: str
   items: List[ReportItem] = attr.ib(factory=list)
-  attachment_files_zipped: bool = attr.ib(default=False)
 
   def _as_markdown(self) -> str:
     md = f"# {self.title} - {self.url} - {self.datetime}\n"
     md += "[TOC]\n"
     for item in self.items:
       md += f"{item.as_markdown()}"
-    if self.attachment_files_zipped:
-      md += "\n!!! note\n    The attachment files were zipped to fit in the SMTP message size limit.\n\n"
     return md
 
   def as_html(self) -> str:
@@ -428,17 +423,21 @@ class MailSender:
               
           # The file size is too big, zipping alltogether
           print("Compressing attachments...")
-          zip_file_path = (TEMP_DIR / get_valid_filename(f"{report.title}_{report.url}_{report.datetime}"))
+          zip_file_path = (TEMP_DIR / get_valid_filename(f"{report.title}_{report.url}_{report.datetime}.zip"))
           with zipfile.ZipFile(zip_file_path, 'w', compression=zipfile.ZIP_DEFLATED) as zip:
 
-            for a in attachment_files:
-              zip.write(a.as_posix())
+            # Just in case two attachments have the same name
+            names = set()
+            for attach_file in attachment_files:
+              name = attach_file.name
+              if name in names: 
+                name = f"bis_{name}"
+              names.add(name)
+
+              zip.write(attach_file.as_posix(), arcname=name)
 
           attachment_files = [zip_file_path]
           zipped = True
-
-        # Store the value of zipped in the report
-        report.attachment_files_zipped = zipped
 
         # Email body
         body = report.as_html()
@@ -464,7 +463,7 @@ class MailSender:
         # Cleaning up 
         if zipped:
           for path in attachment_files:
-                os.remove(path)
+            os.remove(path)
 
 
 def get_arg_parser() -> argparse.ArgumentParser:
